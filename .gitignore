@@ -1,0 +1,3 @@
+# ignore pycache and data files
+__pycache__/
+data/
