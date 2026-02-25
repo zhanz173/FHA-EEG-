@@ -412,7 +412,7 @@ class DeepEnsembleTrainer:
         return WeightedRandomSampler(weights=weights, num_samples=n, replacement=True, generator=gen)
 
     def _step(self, model: nn.Module, batch: Dict[str, Any], scaler: Optional[torch.cuda.amp.GradScaler] = None,
-              optim: Optional[torch.optim.Optimizer] = None, per_sample_weight: bool = False, use_good_labels_only: bool = False, bootstrapping_targets: float = 0.0) -> tuple[torch.Tensor, Dict[str, Any]]:
+              optim: Optional[torch.optim.Optimizer] = None, per_sample_weight: bool = False, use_good_labels_only: bool = False, bootstrapping_targets: float = 0.0) -> torch.Tensor:
         x, y = batch["x"], batch["y"] # x: input, y: (B,K) multi-label targets
         sample_weights = batch.get("sample_weights", None) if per_sample_weight else None
         labels_mask = batch.get("labels_mask", None) if use_good_labels_only else None
@@ -447,12 +447,7 @@ class DeepEnsembleTrainer:
                 scaler.update()
                 optim.zero_grad(set_to_none=True)
 
-        with torch.no_grad():
-            # also move metrics to fp32 to be safe
-            probs = sigmoid_probs(logits.float())
-            prf1 = multilabel_prf1(probs, y)
-
-        return loss.detach(), prf1
+        return loss.detach()
 
     @torch.no_grad()
     def _eval(self, model: nn.Module, loader: DataLoader) -> Dict[str, float]:
@@ -515,7 +510,7 @@ class DeepEnsembleTrainer:
             model.train()
             for batch in train_loader:
                 batch = to_device(batch, self.device)
-                loss, _ = self._step(model, batch, scaler, optim, per_sample_weight=cfg.use_sample_weight, use_good_labels_only=cfg.use_good_labels_only, bootstrapping_targets=cfg.bootstrapping_targets)
+                loss = self._step(model, batch, scaler, optim, per_sample_weight=cfg.use_sample_weight, use_good_labels_only=cfg.use_good_labels_only, bootstrapping_targets=cfg.bootstrapping_targets)
                 if not torch.isfinite(loss):
                     print(f"[WARN] Non-finite training loss encountered (epoch {epoch}). Batch skipped.")
 

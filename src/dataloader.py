@@ -34,23 +34,17 @@ class EEGDatasetWithLabel(Dataset):
         self._ordinal = return_ordinal
         self._read_metadata(metadata) # read metadata if provided
 
-    def _read_metadata(self, metadata_path, drop_dupliate_EEG=True):
+    def _read_metadata(self, metadata_path):
         ## matching metadata to index
         if metadata_path is None:
              ## unsupervised mode, return none labels
              ## rename eeg_id to ScanID for consistency
             self.index = self.index.rename(columns={"eeg_id": "ScanID"})
             return
-        
-        # check if the path is absolute or relative
-        if os.path.isabs(metadata_path):
-            abs_path = metadata_path
-        else:
-            abs_path = os.path.join(self.root, metadata_path)
-            
-        print(f"Loading metadata from {abs_path}")
+
+        print(f"Loading metadata from {metadata_path}")
         n_samples_pre = len(self.index)
-        meta = pd.read_csv(abs_path)
+        meta = pd.read_csv(metadata_path)
         meta = meta.dropna(subset=['Hashed_ReportURN']) # No diagnosis available
         meta = meta.query('HourDiffURN <= 24') # keep only EEGs within 24 hours of admission
 
@@ -240,7 +234,7 @@ class EEGDatasetWithLabel(Dataset):
 
 def unit_test(dataset):
     print(f"Dataset length: {len(dataset)}")
-    for i in range(2):
+    for i in range(1):
         sample = dataset[i]
         x_lbr, x_welch = sample['x']
         label = sample['y']
@@ -248,13 +242,16 @@ def unit_test(dataset):
         print(f"Sample {i}: LaBraM shape: {x_lbr.shape}, Welch shape: {x_welch.shape}, Label: {label}, Age: {age}, Weight: {sample['sample_weight']}, ID: {sample['id']}, Labels Mask : {sample['labels_mask']}")
         # print datatype
         print(f"Data types - LaBraM: {x_lbr.dtype}, Welch: {x_welch.dtype}, Label: {label.dtype}, Age: {type(age)}, Weight: {type(sample['sample_weight'])}, ID: {type(sample['id'])}, Labels Mask: {type(sample['labels_mask'])}")
+        # print label
+        print(f"Label values: {label}, Label mask: {sample['labels_mask']}")
+        print("-----------------")
     #postive weights
     pos_weights = dataset.get_positive_weights()
     print(f"Positive weights for each class: {pos_weights}")
 
 def test_compatibility_with_torchloader(dataset):
     from torch.utils.data import DataLoader
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=1)
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=1)
     for batch in dataloader:
         x_lbr_batch, x_welch_batch = batch['x']
         y_batch = batch['y']
@@ -267,7 +264,7 @@ def test_compatibility_with_torchloader(dataset):
 
 
 if __name__ == "__main__":
-    dataset = EEGDatasetWithLabel(root=r"H:\\EEG_features\\EEG_features_labram_welch", metadata=r"H:\Thesis_Project\Essembles\checkpoints\train.csv", return_ids=True, return_ordinal=True, return_neurologist_ids=True)
+    dataset = EEGDatasetWithLabel(root=r"H:\\EEG_features\\EEG_features_labram_welch", metadata=r"H:\Thesis_Project\Essembles\checkpoints\train.csv", return_ids=True, return_ordinal=False, return_neurologist_ids=True)
     test_compatibility_with_torchloader(dataset)
     
     unit_test(dataset)

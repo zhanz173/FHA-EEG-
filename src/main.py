@@ -21,8 +21,9 @@ def build_dataset(dataset_csv_path, experiment_name="example"):
     print(f"Validation set size: {val_set.shape[0]}")
 
     # save train and val sets to separate CSV files
-    train_set.to_csv(rf"E:\EEG\FHA\{experiment_name}\train_data.csv", index=False)
-    val_set.to_csv(rf"E:\EEG\FHA\{experiment_name}\eval_data.csv", index=False)
+    os.makedirs(f"{experiment_name}", exist_ok=True)
+    train_set.to_csv(rf"{experiment_name}\train_data.csv", index=False)
+    val_set.to_csv(rf"{experiment_name}\eval_data.csv", index=False)
 
 def validate_dataset_splits(experiment_name="checkpoints_run"):
     import pandas as pd
@@ -54,11 +55,11 @@ if __name__ == "__main__":
     import os
     import pandas as pd
 
-    FHA_EEG_FEATURES_ROOT = r"H:\EEG_features\EEG_features_labram_welch"
+    FHA_EEG_FEATURES_ROOT = r"H:\EEG_features\EEG_features_labram_welch_4s"
     FHA_EEG_METADATA_ROOT = r"H:\EEG\FHA\label_matched_metadata.csv"
     EXPERIMENT_NAME = r"example"
     build_dataset(dataset_csv_path=FHA_EEG_METADATA_ROOT, experiment_name=EXPERIMENT_NAME)
-    #validate_dataset_splits(experiment_name=EXPERIMENT_NAME)  # check for data leakage
+    validate_dataset_splits(experiment_name=EXPERIMENT_NAME)  # check for data leakage
 
     CURRENT_FILEPATH = os.path.dirname(os.path.abspath(__file__))
     test_training_config = TrainConfig(
@@ -78,8 +79,10 @@ if __name__ == "__main__":
     with open(f"{EXPERIMENT_NAME}/training_config.txt", "w") as f:
         f.write(str(test_training_config))
 
-    train_ds = EEGDatasetWithLabel(root=FHA_EEG_FEATURES_ROOT, metadata=CURRENT_FILEPATH+f"\\{EXPERIMENT_NAME}\\train_data.csv", return_ids=True)
-    val_ds = EEGDatasetWithLabel(root=FHA_EEG_FEATURES_ROOT, metadata=CURRENT_FILEPATH+f"\\{EXPERIMENT_NAME}\\eval_data.csv", return_ids=True)
+    print("Initializing training datasets...")
+    train_ds = EEGDatasetWithLabel(root=FHA_EEG_FEATURES_ROOT, metadata=f"{EXPERIMENT_NAME}/train_data.csv", return_ids=True,return_ordinal=False, return_neurologist_ids=True)
+    print("Initializing validation datasets...")
+    val_ds = EEGDatasetWithLabel(root=FHA_EEG_FEATURES_ROOT, metadata=f"{EXPERIMENT_NAME}/eval_data.csv", return_ids=True, return_ordinal=False, return_neurologist_ids=True)
     
     trainer = DeepEnsembleTrainer(
         model_fn=model_gen,
@@ -90,7 +93,6 @@ if __name__ == "__main__":
     )
 
     results = train(trainer, train_ds, val_ds, test_training_config)
-    del train_ds
 
     unc_test, metrics = trainer.ensemble_uncertainty(val_ds, checkpoint_dir=f"{EXPERIMENT_NAME}/")
     unc_test.to_csv(rf"{EXPERIMENT_NAME}/uncertainty_evalsamples.csv", index=False)

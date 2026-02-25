@@ -155,7 +155,7 @@ class GRU_Classifier(nn.Module):
 
         # --- Input Normalization ---
         self.LBR_norm = nn.LayerNorm(200)
-        self.Welch_norm = nn.LayerNorm(25)
+        self.Welch_norm = nn.LayerNorm(50)
 
         # --- Encoders ---
         # Welch: Optimized with standard stride patterns
@@ -276,13 +276,13 @@ def count_parameters(model: nn.Module) -> int:
 
 # expect data shape: tuple(LaBraM shape: (89, 200), Welch shape: (89, 20, 25)), Label: [1. 1. 1. 1. 1.]
 def unit_test():
-    model = GRU_Classifier(hidden_size=128, num_layers=4, num_classes=5, num_pool_heads=3, neurologist_correction_config=NeurologistCorrectionConfig(num_neurologists=10, rater_emb_dim=8), use_transformer=False, pooling_output_size=64)
-    x_lbr = torch.randn(4, 89, 200)  # batch of 4, 89 time steps, 200 LaBraM features
-    x_welch = torch.abs(torch.randn(4, 89, 20, 25))  # batch of 4, 89 time steps, 20 channels, 25 Welch features
-    outputs = model((x_lbr, x_welch))
-    print("Output:", outputs)  # Expected: (4, 5)
-    assert outputs[0].shape == (4, 5), "Output shape is incorrect"
+    model = GRU_Classifier(hidden_size=64, num_layers=3, num_classes=5, num_pool_heads=3, neurologist_correction_config=NeurologistCorrectionConfig(num_neurologists=10, rater_emb_dim=8), use_transformer=False, pooling_output_size=64)
     print("Number of trainable parameters:", count_parameters(model))
+    x_lbr = torch.randn(2, 89, 200)  # batch of 4, 89 time steps, 200 LaBraM features
+    x_welch = torch.abs(torch.randn(2, 89, 20, 50))  # batch of 4, 89 time steps, 20 channels, 25 Welch features
+    outputs, _ = model((x_lbr, x_welch))
+    print("Output:", outputs)  # Expected: (4, 5)
+    assert outputs.shape == (2, 5), "Output shape is incorrect"
 
 if __name__ == "__main__":
     unit_test()

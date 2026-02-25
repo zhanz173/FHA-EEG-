@@ -1,3 +1,7 @@
 # ignore pycache and data files
 __pycache__/
+.vscode/
 data/
+example/
+notebooks/
+logs/
