@@ -2,6 +2,10 @@
 __pycache__/
 .vscode/
 data/
-example/
 notebooks/
 logs/
+
+# ignore trained models and results
+example/ 
+models/
+experiments/ 

@@ -2,7 +2,6 @@ import torch
 import numpy as np
 import os
 import h5py
-import mne
 import pandas as pd
 from torch.utils.data import Dataset
 from functools import partial

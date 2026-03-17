@@ -416,11 +416,12 @@ class DeepEnsembleTrainer:
         x, y = batch["x"], batch["y"] # x: input, y: (B,K) multi-label targets
         sample_weights = batch.get("sample_weights", None) if per_sample_weight else None
         labels_mask = batch.get("labels_mask", None) if use_good_labels_only else None
-
+        neurologist_ids = batch.get("neurologist_id", None) # (B,) with values in [0, num_neurologists-1], used for neurologist correction if applicable
+        
 
         # ---- Non-AMP path ----    
         if scaler is None:
-            logits, _ = model(x)
+            logits, _ = model(x, neurologist_ids=neurologist_ids)
             loss_classification = focal_bce_with_logits_loss(logits, y, positive_weight=self.get_positive_weights(), sample_weights=sample_weights, labels_mask=labels_mask, bootstrapping=bootstrapping_targets)
             aux_loss = model.get_aux_loss() # put aux loss or l2 reg loss here if needed; default is zero
             loss = loss_classification + 0.01 * aux_loss
@@ -431,7 +432,7 @@ class DeepEnsembleTrainer:
         else:
         # ---- AMP path ----
             with torch.autocast('cuda', dtype=torch.bfloat16):
-                logits, _= model(x)
+                logits, _= model(x, neurologist_ids=neurologist_ids)
 
             # Compute numerically sensitive loss in full fp32
             with torch.autocast('cuda', enabled=False):
@@ -593,12 +594,13 @@ class DeepEnsembleTrainer:
         return {"checkpoints": ckpts, "checkpoint_dir": self.checkpoint_dir}
 
     @torch.no_grad()
-    def _predict_member(self, model: nn.Module, loader: DataLoader) -> Tuple[torch.Tensor, torch.Tensor, List[Any]]:
+    def _predict_member(self, model: nn.Module, loader: DataLoader, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor, List[Any]]:
         model.eval()
         probs_list, targets_list, ids_list = [], [], []
         for batch in loader:
             batch = to_device(batch, self.device)
-            logits = model(batch["x"])[0]  # tuple of (logits, ...); we only need logits here
+            mock_ids = torch.zeros((batch["y"].size(0),), dtype=torch.long, device=batch["y"].device)
+            logits = model(batch["x"], neurologist_ids=mock_ids)[0]  # tuple of (logits, ...); we only need logits here
             probs = torch.sigmoid(logits)
             probs_list.append(probs)
             targets_list.append(batch.get("y", torch.full((probs.size(0),), -1, dtype=torch.long, device=probs.device)))
@@ -631,25 +633,18 @@ class DeepEnsembleTrainer:
         for ck in checkpoints:
             state = torch.load(ck, map_location=self.device, weights_only=False)
             model = self.build_model().to(self.device)
-            model.load_state_dict(state["state_dict"]) 
-            probs, t, ids_list = self._predict_member(model, loader)
+            model.load_state_dict(state["state_dict"], strict=False) 
+            probs, t, ids_list = self._predict_member(model, loader, batch_size=batch_size)
             member_probs.append(probs)
             targets = t if targets is None else targets
             ids = ids_list
+        # Ensure ids is an iterable of length N; if None, create a list of None so enumerate(...) is safe.
+        ids_filled = ids if ids is not None else [None] * N
+
         # Stack: (M, N, K)
         P = torch.stack(member_probs, dim=0)
         P_mean = P.mean(dim=0)  # (N,K)
-
-        # --------------------------------------------
-        # Entropy decomposition (per-label) using helper
-        # --------------------------------------------
-        H_total_labels = bernoulli_entropy(P_mean) # (N,K)
-        H_expected_labels = bernoulli_entropy(P).mean(dim=0) # (N,K)
-        H_epistemic_labels = H_total_labels - H_expected_labels # (N,K)
-
-        var_per_label = P.var(dim=0)  # (N,K)
-        var_sum = var_per_label.sum(dim=1)  # (N,)
-
+        N, K = P_mean.shape
         # Metrics if targets exist (>=0)
         metrics = {}
         if (targets is not None) and (targets.min().item() >= 0):
@@ -658,21 +653,34 @@ class DeepEnsembleTrainer:
             ece = ece_binary_per_label(P_mean, targets)
             metrics = {**prf1, "bce": bce, "ece": ece}
 
+        if P.shape[0] > 1:
+            # --------------------------------------------
+            # Entropy decomposition (per-label) using helper
+            # --------------------------------------------
+            H_total_labels = bernoulli_entropy(P_mean) # (N,K)
+            H_expected_labels = bernoulli_entropy(P).mean(dim=0) # (N,K)
+            H_epistemic_labels = H_total_labels - H_expected_labels # (N,K)
+
+            var_per_label = P.var(dim=0)  # (N,K)
+            var_sum = var_per_label.sum(dim=1)  # (N,)
             
-        N, K = P_mean.shape
-        # Ensure ids is an iterable of length N; if None, create a list of None so enumerate(...) is safe.
-        ids_filled = ids if ids is not None else [None] * N
-        data = {
-            "id": [i if i is not None else idx for idx, i in enumerate(ids_filled)],
-            "conf_mean": P_mean.mean(dim=1).cpu().numpy(),
-            "var_sum": var_sum.cpu().numpy(),
-        }
-        for k in range(K):
-            data[f"p_label{k}"] = P_mean[:, k].cpu().numpy()
-            data[f"var_label{k}"] = var_per_label[:, k].cpu().numpy()
-            data[f"H_total_label{k}"] = H_total_labels[:, k].cpu().numpy()
-            data[f"H_expected_label{k}"] = H_expected_labels[:, k].cpu().numpy()
-            data[f"H_epistemic_label{k}"] = H_epistemic_labels[:, k].cpu().numpy()
+            data = {
+                "id": [i if i is not None else idx for idx, i in enumerate(ids_filled)],
+                "var_sum": var_sum.cpu().numpy(),
+            }
+            for k in range(K):
+                data[f"p_label{k}"] = P_mean[:, k].cpu().numpy()
+                data[f"var_label{k}"] = var_per_label[:, k].cpu().numpy()
+                data[f"H_total_label{k}"] = H_total_labels[:, k].cpu().numpy()
+                data[f"H_expected_label{k}"] = H_expected_labels[:, k].cpu().numpy()
+                data[f"H_epistemic_label{k}"] = H_epistemic_labels[:, k].cpu().numpy()
+        else:
+            data = {
+                "id": [i if i is not None else idx for idx, i in enumerate(ids_filled)],
+            }
+            for k in range(K):
+                data[f"p_label{k}"] = P_mean[:, k].cpu().numpy()
+
         if (targets is not None) and (targets.min().item() >= 0):
             for k in range(K):
                 data[f"y_label{k}"] = targets[:, k].cpu().numpy()

@@ -3,12 +3,13 @@ import torch.nn as nn
 import numpy as np
 from typing import Optional
 from dataclasses import dataclass
+from .components import EEGGATEncoder, EEGCONVEncoder, build_eeg_edge_index, EEG_GRAPH_NEIGHBORS, EEG_CHANNELS_ORDER
 
 @dataclass
 class NeurologistCorrectionConfig:
     num_neurologists: int
     rater_emb_dim: int = 4
-    default_mean_rater: bool = True  # Whether to use the mean rater embedding when neurologist ID is not provided
+    default_mean_rater: bool = True  # UNUSED: Whether to use the mean rater embedding when neurologist ID is not provided
 
 
 class VectorizedPredHead(nn.Module):
@@ -103,35 +104,34 @@ class EfficientAttnPool(nn.Module):
         context = torch.einsum('btk,bth->bkh', attn_weights, x)
         context = self.output_projector(context)
         return context, attn_weights
-
 class RaterCorrectionModule(nn.Module):
-    '''
-    Simple linear correction model p(y|x, rater) = p(z|x) * p(y|z, rater) = p(z|x) * a + b'''
     def __init__(self, num_neurologists, rater_emb_dim, num_classes):
-        assert num_neurologists > 0, "num_neurologists must be > 0 for RaterCorrectionModule"
-        assert rater_emb_dim > 0, "rater_emb_dim must be > 0 for RaterCorrectionModule"
-
         super().__init__()
-        self.rater_emb = nn.Embedding(num_neurologists+1, rater_emb_dim) # learning 0 position as mean rater embedding
+        self.num_classes = num_classes
+        self.rater_emb = nn.Embedding(num_neurologists + 1, rater_emb_dim)
         self.projector = nn.Sequential(
             nn.LayerNorm(rater_emb_dim),
             nn.Linear(rater_emb_dim, rater_emb_dim),
             nn.GELU(),
-            nn.Linear(rater_emb_dim, num_classes * 2) # Predict all class corrections at once [0:mum_classes] for a, [num_classes: 2*num_classes] for b
+            nn.Linear(rater_emb_dim, num_classes * 2)
         )
 
-    def forward(self, z, neurologist_ids):
-        # during training, randomly mask out neurologist IDs to learn a "mean rater" embedding in the 0 position for inference when neurologist ID is not available
-        if self.training:
-            mask = torch.rand(neurologist_ids.shape, device=neurologist_ids.device) < 0.1  # 10% chance to mask
-            neurologist_ids = neurologist_ids.masked_fill(mask, 0)  # Masked positions get ID 0 (mean rater)
+        # initialize final layer near zero => near identity correction
+        nn.init.zeros_(self.projector[-1].weight)
+        nn.init.zeros_(self.projector[-1].bias)
 
-        z = self.rater_emb(neurologist_ids)
-        rater_params = self.projector(z).view(-1, 2, self.num_classes)
-        a = rater_params[:, 0, :]
-        b = rater_params[:, 1, :]
-        rater_delta = a * z + b
-        return rater_delta
+    def forward(self, z, neurologist_ids):
+        z_h = self.rater_emb(neurologist_ids)
+        params = self.projector(z_h).view(-1, 2, self.num_classes)
+        delta_a = params[:, 0, :]
+        delta_b = params[:, 1, :]
+
+        scale = 1.0 + 0.1 * delta_a   # optionally damp it
+        bias  = 0.1 * delta_b
+        logits_post = scale * z + bias
+
+        reg = (delta_a ** 2 + delta_b ** 2).mean()
+        return logits_post, reg
 
 class Identity(nn.Module):
     def forward(self, x, *ignore): 
@@ -140,14 +140,14 @@ class Identity(nn.Module):
 class GRU_Classifier(nn.Module):
     def __init__(
         self,
-        hidden_size: int,
-        num_layers: int,
+        encoder_hidden_size: int = 64,
+        RNN_hidden_size: int = 64,
+        num_layers: int = 2,
         num_classes: int = 5,
         num_pool_heads: int = 4,
         neurologist_correction_config: Optional[NeurologistCorrectionConfig] = None,
         use_transformer: bool = False, # Architectural toggle
         pooling_output_size: Optional[int] = None
-        
     ):
         super().__init__()
         self.neurologist_correction_config = neurologist_correction_config
@@ -159,44 +159,33 @@ class GRU_Classifier(nn.Module):
 
         # --- Encoders ---
         # Welch: Optimized with standard stride patterns
-        self.F_encoder = nn.Sequential(
-            nn.Conv2d(20, 32, 5, padding=2), nn.BatchNorm2d(32), nn.GELU(),
-            nn.MaxPool2d((2,1), stride=(2,1)),
-            nn.Dropout(0.1),
-            nn.Conv2d(32, 32, 5, padding=2), nn.BatchNorm2d(32), nn.GELU(),
-            nn.MaxPool2d((2,1), stride=(2,1)),
-            nn.Dropout(0.1),
-            nn.Conv2d(32, 64, 5, padding=2), nn.BatchNorm2d(64), nn.GELU(),
-            nn.Dropout(0.1),
-            nn.AdaptiveMaxPool2d((1, None)) # Output: [B, 64, 1, T]
-        )
-        self.f_dim = 64 # Output dim of F_encoder
+        self.F_encoder = EEGGATEncoder(in_features=50, hidden_features=encoder_hidden_size, out_features=encoder_hidden_size, pool='mean', dropout=0.1)
 
         # LaBraM:
         self.L_encoder = nn.Sequential(
-            nn.Linear(200, hidden_size), nn.GELU(),
+            nn.Linear(200, encoder_hidden_size), nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_size, hidden_size), nn.GELU(),
+            nn.Linear(encoder_hidden_size, encoder_hidden_size), nn.GELU(),
             nn.Dropout(0.1)
         )
 
         # --- Gated Fusion ---
-        self.fusion = GatedFusion(hidden_size, self.f_dim, hidden_size)
+        self.fusion = GatedFusion(encoder_hidden_size, encoder_hidden_size, RNN_hidden_size)
 
         # --- Temporal Backbone ---
         if use_transformer:
-            encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_size, nhead=4, batch_first=True)
+            encoder_layer = nn.TransformerEncoderLayer(d_model=RNN_hidden_size, nhead=4, batch_first=True)
             self.backbone = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         else:
-            self.backbone = nn.GRU(hidden_size, hidden_size, num_layers, 
+            self.backbone = nn.GRU(RNN_hidden_size, RNN_hidden_size, num_layers, 
                                    batch_first=True, dropout=0.1 if num_layers > 1 else 0)
         self.dropout = nn.Dropout(0.1)
 
 
         # --- Pooling & Heads ---
-        self.shared_pool = EfficientAttnPool(hidden_size, output_size=pooling_output_size or hidden_size, num_heads=num_pool_heads)
+        self.shared_pool = EfficientAttnPool(RNN_hidden_size, output_size=pooling_output_size or RNN_hidden_size, num_heads=num_pool_heads)
         # Vectorized Head 
-        top_in_dim = num_pool_heads * (pooling_output_size or hidden_size)
+        top_in_dim = num_pool_heads * (pooling_output_size or RNN_hidden_size)
 
         self.pred_head = VectorizedPredHead(top_in_dim, num_classes)
 
@@ -207,19 +196,20 @@ class GRU_Classifier(nn.Module):
                 rater_emb_dim=neurologist_correction_config.rater_emb_dim,
                 num_classes=num_classes)
         else:
-            self.rater_correction = Identity()  # No correction applied
+            self.rater_correction = None # No correction applied
+
+        self.edge_index = build_eeg_edge_index(EEG_CHANNELS_ORDER, EEG_GRAPH_NEIGHBORS)
 
 
     def encode_features(self, x_lbr, x_welch):
         # x_lbr: [B, T, 200]
-        # x_welch: [B, T, 20, F] -> Permute to [B, 20, F, T] for Conv2d
+        # x_welch: [B, T, 20, F] -> Permute to [B, F, 20, T] for Conv2d
         
         # Welch path
         x_welch = torch.log1p(x_welch) # Log scaling
         x_w = self.Welch_norm(x_welch) 
-        x_w = x_w.permute(0, 2, 3, 1) 
-        f_feat = self.F_encoder(x_w) # [B, 64, 1, T]
-        f_feat = f_feat.squeeze(2).permute(0, 2, 1) # [B, T, 64]
+        x_w = x_w.permute(0, 3, 2, 1)  # [B, F, 20, T]
+        f_feat = self.F_encoder(x_w, edge_index=self.edge_index.to(x_w.device)) # [B, T, H]
 
         # LaBraM path
         x_l = self.LBR_norm(x_lbr)
@@ -244,7 +234,14 @@ class GRU_Classifier(nn.Module):
 
         default return zero tensor to avoid breaking existing training loop if not used.
         '''
-        return torch.tensor(0.0)
+        
+        return 0.01* self.l2_loss
+    
+    def load_pretrained_encoder_weights(self, pretrained_state_dict):
+        # Assuming the state dict is for the entire model, we need to extract the encoder part
+        encoder_state_dict = {k.replace("F_encoder.", ""): v for k, v in pretrained_state_dict.items() if k.startswith("F_encoder.")}
+        self.F_encoder.load_state_dict(encoder_state_dict, strict=False)  # Load with strict=False to ignore missing keys
+        print("Pretrained encoder loaded successfully.")
 
     def forward(self, x, mask=None, neurologist_ids=None):
         x_lbr, x_welch = x
@@ -266,9 +263,14 @@ class GRU_Classifier(nn.Module):
         logits = self.pred_head(flat) # [B, num_classes]
 
         # 5. Correction (if neurologist IDs provided)
-        logits = self.rater_correction(logits, neurologist_ids) if neurologist_ids is not None else logits
+        if neurologist_ids is not None and self.rater_correction is not None:
+            logits_post, l2_loss = self.rater_correction(logits, neurologist_ids)
+        else:
+            logits_post, l2_loss = logits, 0
 
-        return logits, attn_weights
+        self.l2_loss = l2_loss  # Store for auxiliary loss calculation
+
+        return logits_post, attn_weights
 
 
 def count_parameters(model: nn.Module) -> int:
@@ -276,11 +278,11 @@ def count_parameters(model: nn.Module) -> int:
 
 # expect data shape: tuple(LaBraM shape: (89, 200), Welch shape: (89, 20, 25)), Label: [1. 1. 1. 1. 1.]
 def unit_test():
-    model = GRU_Classifier(hidden_size=64, num_layers=3, num_classes=5, num_pool_heads=3, neurologist_correction_config=NeurologistCorrectionConfig(num_neurologists=10, rater_emb_dim=8), use_transformer=False, pooling_output_size=64)
+    model = GRU_Classifier(encoder_hidden_size=128, RNN_hidden_size=64, num_layers=2, num_classes=5, num_pool_heads=3, neurologist_correction_config=NeurologistCorrectionConfig(num_neurologists=10, rater_emb_dim=8), use_transformer=False, pooling_output_size=64)
     print("Number of trainable parameters:", count_parameters(model))
-    x_lbr = torch.randn(2, 89, 200)  # batch of 4, 89 time steps, 200 LaBraM features
-    x_welch = torch.abs(torch.randn(2, 89, 20, 50))  # batch of 4, 89 time steps, 20 channels, 25 Welch features
-    outputs, _ = model((x_lbr, x_welch))
+    x_lbr = torch.randn(2, 89, 200)  # batch of 2, 89 time steps, 200 LaBraM features
+    x_welch = torch.abs(torch.randn(2, 89, 20, 50))  # batch of 2, 89 time steps, 20 channels, 25 Welch features
+    outputs, _ = model((x_lbr, x_welch), neurologist_ids=torch.tensor([1, 2]))  # Provide neurologist IDs for correction
     print("Output:", outputs)  # Expected: (4, 5)
     assert outputs.shape == (2, 5), "Output shape is incorrect"
 
