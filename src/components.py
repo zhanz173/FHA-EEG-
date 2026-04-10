@@ -86,7 +86,14 @@ class EEGGATEncoder(nn.Module):
         super().__init__()
         self.pool = pool
 
-        self.gat1 = GATConv(in_features, hidden_features // 2, heads=2, concat=True)
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_features, hidden_features, kernel_size=(1,1)),
+            nn.BatchNorm2d(hidden_features),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+
+        self.gat1 = GATConv(hidden_features, hidden_features // 2, heads=2, concat=True)
         self.bn1 = nn.BatchNorm1d(hidden_features)
 
         self.gat2 = GATConv(hidden_features, hidden_features // 2, heads=2, concat=True)
@@ -119,9 +126,10 @@ class EEGGATEncoder(nn.Module):
         return x
 
     def forward(self, x, edge_index):
-        # x: [B, F_in, N, T]
-        B, F_in, N, T = x.shape
+        # x: [B, F_in, N, T], usually N = 19 for EEG channels
+        x = self.encoder(x)  # [B, F_hidden, N, T]
 
+        B, F_in, N, T = x.shape
         # turn each time slice into one graph
         x = x.permute(0, 3, 2, 1).contiguous()   # [B, T, N, F_in]
         x = x.view(B * T, N, F_in)               # [B*T, N, F_in]

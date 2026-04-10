@@ -21,6 +21,7 @@ def build_dataset(dataset_csv_path, experiment_name="example"):
     print(f"Validation set size: {val_set.shape[0]}")
 
     # save train and val sets to separate CSV files
+
     os.makedirs(f"{experiment_name}", exist_ok=True)
     train_set.to_csv(rf"{experiment_name}\train.csv", index=False)
     val_set.to_csv(rf"{experiment_name}\eval.csv", index=False)
@@ -44,7 +45,8 @@ def model_gen(args:dict):
     neurologist_correction_config = args.get("neurologist_correction_config", None)
     pooling_output_size = args.get("pooling_output_size", 64)
     pretrained_encoder_path = args.get("pretrained_encoder_path", None)
-    model = GRU_Classifier(encoder_hidden_size=encoder_hidden_size, RNN_hidden_size=RNN_hidden_size, num_layers=num_layers, num_classes=num_classes, neurologist_correction_config=neurologist_correction_config, pooling_output_size=pooling_output_size)
+    use_mean_pooling = args.get("use_mean_pooling", False)
+    model = GRU_Classifier(encoder_hidden_size=encoder_hidden_size, RNN_hidden_size=RNN_hidden_size, num_layers=num_layers, num_classes=num_classes, neurologist_correction_config=neurologist_correction_config, pooling_output_size=pooling_output_size, use_mean_pooling=use_mean_pooling)
     if pretrained_encoder_path:
         print(f"Loading pretrained encoder from {pretrained_encoder_path}...")
         pretrained_state_dict = torch.load(pretrained_encoder_path, map_location='cpu')
@@ -56,6 +58,9 @@ def train(trainer: DeepEnsembleTrainer, train_ds, val_ds, config: TrainConfig, e
     return result
 
 
+def evaluate_uncertainty(trainer: DeepEnsembleTrainer, val_ds, checkpoint_dir):
+    unc_test, metrics = trainer.ensemble_uncertainty(val_ds, checkpoint_dir=checkpoint_dir)
+    return unc_test, metrics
 
 if __name__ == "__main__":
     import os
@@ -64,9 +69,8 @@ if __name__ == "__main__":
 
     FHA_EEG_FEATURES_ROOT = r"H:\EEG_features\EEG_features_labram_welch_4s"
     FHA_EEG_METADATA_ROOT = r"E:\project\FHA-EEG-\data\full_matched.csv"
-    EXPERIMENT_NAME = r"experiments"
+    EXPERIMENT_NAME = r"example"
     #build_dataset(dataset_csv_path=FHA_EEG_METADATA_ROOT, experiment_name=EXPERIMENT_NAME)
-    #validate_dataset_splits(experiment_name=EXPERIMENT_NAME)  # check for data leakage
 
     CURRENT_FILEPATH = os.path.dirname(os.path.abspath(__file__))
     nerologist_table_config = NeurologistCorrectionConfig (
@@ -75,7 +79,7 @@ if __name__ == "__main__":
         default_mean_rater=True)
 
     test_training_config = TrainConfig(
-        epochs=10,
+        epochs=15,
         use_positive_weight=False, # default use focal loss, no pos weight needed
         use_sample_weight=False,
         use_good_labels_only=False,
@@ -91,27 +95,21 @@ if __name__ == "__main__":
     with open(f"{EXPERIMENT_NAME}/training_config.txt", "w") as f:
         f.write(str(test_training_config))
 
+    validate_dataset_splits(experiment_name=EXPERIMENT_NAME)  # check for data leakage
     print("Initializing training datasets...")
-    train_ds = EEGDatasetWithLabel(root=FHA_EEG_FEATURES_ROOT, metadata=r"E:\project\FHA-EEG-\Nurologist_Correction_Experiment_1\Baseline\train.csv", return_ids=True,return_ordinal=False, return_neurologist_ids=True)
+    train_ds = EEGDatasetWithLabel(root=FHA_EEG_FEATURES_ROOT, metadata=f"{EXPERIMENT_NAME}/train.csv", return_ids=True,return_ordinal=False, return_neurologist_ids=True)
     print("Initializing validation datasets...")
-    val_ds = EEGDatasetWithLabel(root=FHA_EEG_FEATURES_ROOT, metadata=r"E:\project\FHA-EEG-\Nurologist_Correction_Experiment_1\Baseline\eval.csv", return_ids=True, return_ordinal=False, return_neurologist_ids=True)
+    val_ds = EEGDatasetWithLabel(root=FHA_EEG_FEATURES_ROOT, metadata=f"{EXPERIMENT_NAME}/eval.csv", return_ids=True, return_ordinal=False, return_neurologist_ids=True)
     
     trainer = DeepEnsembleTrainer(
         model_fn=model_gen,
         num_classes=5,
-        model_kwargs={"encoder_hidden_size": 64, "RNN_hidden_size": 64, "num_layers": 2, "num_classes": 5, "num_pool_heads": 3, "pooling_output_size": 64, "pretrained_encoder_path": None, "neurologist_correction_config": nerologist_table_config},
+        model_kwargs={"encoder_hidden_size": 128, "RNN_hidden_size": 64, "num_layers": 3, "num_classes": 5, "num_pool_heads": 4, "pooling_output_size": 64, "pretrained_encoder_path": None, "neurologist_correction_config": None, "use_mean_pooling": False},
         device="cuda" ,
         checkpoint_dir=f"{EXPERIMENT_NAME}/",
     )
     results = train(trainer, train_ds, val_ds, test_training_config, ensemble_size=1)
 
-    ## after training, evaluate uncertainty on validation set and save results
-    trainer = DeepEnsembleTrainer(
-        model_fn=model_gen,
-        num_classes=5,
-        model_kwargs={"encoder_hidden_size": 64, "RNN_hidden_size": 64, "num_layers": 2, "num_classes": 5, "num_pool_heads": 3, "pooling_output_size": 64, "neurologist_correction_config": nerologist_table_config},
-        device="cuda" ,
-        checkpoint_dir=f"{EXPERIMENT_NAME}/",
-    )
-    unc_test, metrics = trainer.ensemble_uncertainty(val_ds, checkpoint_dir=f"{EXPERIMENT_NAME}/")
+     # after training, evaluate uncertainty on validation set and save results
+    unc_test, metrics = evaluate_uncertainty(trainer, val_ds, checkpoint_dir=f"{EXPERIMENT_NAME}/")
     unc_test.to_csv(rf"{EXPERIMENT_NAME}/uncertainty_evalsamples.csv", index=False)

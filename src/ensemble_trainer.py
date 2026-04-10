@@ -422,7 +422,7 @@ class DeepEnsembleTrainer:
         # ---- Non-AMP path ----    
         if scaler is None:
             logits, _ = model(x, neurologist_ids=neurologist_ids)
-            loss_classification = focal_bce_with_logits_loss(logits, y, positive_weight=self.get_positive_weights(), sample_weights=sample_weights, labels_mask=labels_mask, bootstrapping=bootstrapping_targets)
+            loss_classification = bce_with_logits_loss(logits, y, positive_weight=self.get_positive_weights(), sample_weights=sample_weights, labels_mask=labels_mask, bootstrapping=bootstrapping_targets)
             aux_loss = model.get_aux_loss() # put aux loss or l2 reg loss here if needed; default is zero
             loss = loss_classification + 0.01 * aux_loss
             if optim is not None:
@@ -436,7 +436,7 @@ class DeepEnsembleTrainer:
 
             # Compute numerically sensitive loss in full fp32
             with torch.autocast('cuda', enabled=False):
-                loss_classification = focal_bce_with_logits_loss(logits.float(), y.float(), positive_weight=self.get_positive_weights(), sample_weights=sample_weights, labels_mask=labels_mask, bootstrapping=bootstrapping_targets)
+                loss_classification = bce_with_logits_loss(logits.float(), y.float(), positive_weight=self.get_positive_weights(), sample_weights=sample_weights, labels_mask=labels_mask, bootstrapping=bootstrapping_targets)
                 aux_loss = model.get_aux_loss()
                 loss = loss_classification + 0.01 * aux_loss
 

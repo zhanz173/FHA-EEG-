@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from pyparsing import Dict
 from torch.utils.data import Dataset
+import torch
 from typing import Optional, Tuple, Dict
 
 # max (Focal Epi,Gen Epi, Focal Non-epi, Gen Non-epi) <= Abnormality
@@ -232,6 +233,8 @@ class EEGDatasetWithLabel(Dataset):
         return pos_weights.astype('float32')
     
 
+
+
 def unit_test(dataset):
     print(f"Dataset length: {len(dataset)}")
     for i in range(1):
@@ -264,8 +267,8 @@ def test_compatibility_with_torchloader(dataset):
 
 
 if __name__ == "__main__":
-    dataset = EEGDatasetWithLabel(root=r"H:\\EEG_features\\EEG_features_labram_welch", metadata=r"H:\Thesis_Project\Essembles\checkpoints\train.csv", return_ids=True, return_ordinal=False, return_neurologist_ids=True)
-    test_compatibility_with_torchloader(dataset)
+    dataset = EEGDatasetWithLabel(root=r"H:\EEG_features\EEG_features_labram_welch_4s", metadata=r"E:\project\FHA-EEG-\example\eval_data.csv", return_ids=True, return_ordinal=False, return_neurologist_ids=True)
+    #test_compatibility_with_torchloader(dataset)
     
     unit_test(dataset)
     try:

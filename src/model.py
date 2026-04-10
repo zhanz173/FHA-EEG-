@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 from typing import Optional
 from dataclasses import dataclass
-from .components import EEGGATEncoder, EEGCONVEncoder, build_eeg_edge_index, EEG_GRAPH_NEIGHBORS, EEG_CHANNELS_ORDER
+from src.components import EEGGATEncoder, EEGCONVEncoder, build_eeg_edge_index, EEG_GRAPH_NEIGHBORS, EEG_CHANNELS_ORDER
 
 @dataclass
 class NeurologistCorrectionConfig:
@@ -83,9 +83,9 @@ class EfficientAttnPool(nn.Module):
         else:
             self.output_projector = nn.Identity()
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None): # [B, T, H]-> [B, num_heads, output_size]
         # x: [B, T, H]
-        x_norm = self.norm(x)
+        x = self.norm(x)
 
         # Step 1: Calculate attention scores (gated mechanism)
         a_v = self.attention_V(x)  # (B, T, hidden_dim)
@@ -95,7 +95,7 @@ class EfficientAttnPool(nn.Module):
         
         if mask is not None:
             # Mask shape assumption: [B, T]
-            scores = scores.masked_fill(mask.unsqueeze(-1) == 0, float('-inf'))
+            scores = scores.masked_fill(mask.unsqueeze(-1) == 0, -1e9)
             
         attn_weights = torch.softmax(scores, dim=1) # [B, T, K]
         
@@ -104,6 +104,7 @@ class EfficientAttnPool(nn.Module):
         context = torch.einsum('btk,bth->bkh', attn_weights, x)
         context = self.output_projector(context)
         return context, attn_weights
+    
 class RaterCorrectionModule(nn.Module):
     def __init__(self, num_neurologists, rater_emb_dim, num_classes):
         super().__init__()
@@ -136,6 +137,18 @@ class RaterCorrectionModule(nn.Module):
 class Identity(nn.Module):
     def forward(self, x, *ignore): 
         return x
+    
+class MeanPool(nn.Module):
+    def forward(self, x, mask=None):
+        if mask is not None:
+            mask = mask.unsqueeze(-1)  # [B, T, 1]
+            x = x * mask  # Zero out masked positions
+            sum_x = x.sum(dim=1)  # Sum over time
+            count = mask.sum(dim=1)  # Count of valid (non-masked) positions
+            mean_x = sum_x / (count + 1e-8)  # Avoid division by zero
+        else:
+            mean_x = x.mean(dim=1)
+        return mean_x, None
 
 class GRU_Classifier(nn.Module):
     def __init__(
@@ -147,7 +160,8 @@ class GRU_Classifier(nn.Module):
         num_pool_heads: int = 4,
         neurologist_correction_config: Optional[NeurologistCorrectionConfig] = None,
         use_transformer: bool = False, # Architectural toggle
-        pooling_output_size: Optional[int] = None
+        pooling_output_size: Optional[int] = None,
+        use_mean_pooling: bool = False
     ):
         super().__init__()
         self.neurologist_correction_config = neurologist_correction_config
@@ -173,19 +187,19 @@ class GRU_Classifier(nn.Module):
         self.fusion = GatedFusion(encoder_hidden_size, encoder_hidden_size, RNN_hidden_size)
 
         # --- Temporal Backbone ---
-        if use_transformer:
-            encoder_layer = nn.TransformerEncoderLayer(d_model=RNN_hidden_size, nhead=4, batch_first=True)
-            self.backbone = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        else:
-            self.backbone = nn.GRU(RNN_hidden_size, RNN_hidden_size, num_layers, 
+        self.backbone = nn.GRU(RNN_hidden_size, RNN_hidden_size, num_layers, 
                                    batch_first=True, dropout=0.1 if num_layers > 1 else 0)
         self.dropout = nn.Dropout(0.1)
 
 
         # --- Pooling & Heads ---
-        self.shared_pool = EfficientAttnPool(RNN_hidden_size, output_size=pooling_output_size or RNN_hidden_size, num_heads=num_pool_heads)
+        if use_mean_pooling:
+            self.shared_pool = MeanPool()  # Just averages over time steps, no attention
+            top_in_dim = RNN_hidden_size
+        else:
+            self.shared_pool = EfficientAttnPool(RNN_hidden_size, output_size=pooling_output_size or RNN_hidden_size, num_heads=num_pool_heads)
+            top_in_dim = num_pool_heads * (pooling_output_size or RNN_hidden_size)
         # Vectorized Head 
-        top_in_dim = num_pool_heads * (pooling_output_size or RNN_hidden_size)
 
         self.pred_head = VectorizedPredHead(top_in_dim, num_classes)
 
@@ -198,35 +212,40 @@ class GRU_Classifier(nn.Module):
         else:
             self.rater_correction = None # No correction applied
 
-        self.edge_index = build_eeg_edge_index(EEG_CHANNELS_ORDER, EEG_GRAPH_NEIGHBORS)
+        edge_index = build_eeg_edge_index(EEG_CHANNELS_ORDER, EEG_GRAPH_NEIGHBORS)
+        self.register_buffer("edge_index", edge_index)
 
+    def encode_features(self, x_lbr, x_welch, mask=None):
+        x_welch = torch.log1p(x_welch)
+        x_w = self.Welch_norm(x_welch)
+        x_w = x_w.permute(0, 3, 2, 1)
+        f_feat = self.F_encoder(x_w, edge_index=self.edge_index)
 
-    def encode_features(self, x_lbr, x_welch):
-        # x_lbr: [B, T, 200]
-        # x_welch: [B, T, 20, F] -> Permute to [B, F, 20, T] for Conv2d
-        
-        # Welch path
-        x_welch = torch.log1p(x_welch) # Log scaling
-        x_w = self.Welch_norm(x_welch) 
-        x_w = x_w.permute(0, 3, 2, 1)  # [B, F, 20, T]
-        f_feat = self.F_encoder(x_w, edge_index=self.edge_index.to(x_w.device)) # [B, T, H]
-
-        # LaBraM path
         x_l = self.LBR_norm(x_lbr)
-        l_feat = self.L_encoder(x_l) # [B, T, H]
+        l_feat = self.L_encoder(x_l)
 
-        # Fused path
-        return self.fusion(l_feat, f_feat)
+        if mask is not None:
+            m = mask.unsqueeze(-1).to(l_feat.dtype)
+            l_feat = l_feat * m
+            f_feat = f_feat * m
+
+        fused = self.fusion(l_feat, f_feat)
+
+        if mask is not None:
+            fused = fused * m
+
+        return fused
     
-    def extract_embeddings(self, x, mask=None):
+    def extract_embeddings(self, x, mean_over_time=False):
         x_lbr, x_welch = x
         x_fused = self.encode_features(x_lbr, x_welch) # [B, T, H]
         out = self.backbone(x_fused)
 
         if isinstance(out, tuple): out = out[0] # Handle GRU output tuple
         ctx, attn_weights = self.shared_pool(out)
-        ctx = ctx.detach().mean(dim=1)  # Mean over time
-        return ctx, attn_weights  # [B, H]
+        if mean_over_time:
+            out = out.detach().mean(dim=1)  # Mean over time
+        return out, attn_weights  # [B, H]
     
     def get_aux_loss(self, **targets): 
         '''
@@ -243,48 +262,55 @@ class GRU_Classifier(nn.Module):
         self.F_encoder.load_state_dict(encoder_state_dict, strict=False)  # Load with strict=False to ignore missing keys
         print("Pretrained encoder loaded successfully.")
 
-    def forward(self, x, mask=None, neurologist_ids=None):
+    def forward(self, x, mask=None, lengths=None, neurologist_ids=None):
         x_lbr, x_welch = x
-        
-        # 1. Fuse
-        x_fused = self.encode_features(x_lbr.contiguous(), x_welch.contiguous()) # [B, T, H]
-        
-        # 2. Backbone (GRU or Transformer)
-        out = self.backbone(x_fused)
-        if isinstance(out, tuple): out = out[0] # Handle GRU output tuple
+        x_fused = self.encode_features(x_lbr.contiguous(), x_welch.contiguous(), mask=mask)
+
+        if lengths is not None:
+            packed = nn.utils.rnn.pack_padded_sequence(
+                x_fused,
+                lengths.cpu(),
+                batch_first=True,
+                enforce_sorted=False
+            )
+            out, _ = self.backbone(packed)
+            out, _ = nn.utils.rnn.pad_packed_sequence(out, batch_first=True)
+        else:
+            out = self.backbone(x_fused)
+            if isinstance(out, tuple):
+                out = out[0]
+
+        if isinstance(out, tuple):
+            out = out[0]
+
         out = self.dropout(out)
-
-        # 3. Pool
-        # ctx: [B, K, H], weights: [B, T, K] (useful for visualization)
         ctx, attn_weights = self.shared_pool(out, mask=mask)
-        flat = ctx.flatten(start_dim=1) # [B, K*H]
+        flat = ctx.flatten(start_dim=1)
+        logits = self.pred_head(flat)
 
-        # 4. Predict (Vectorized)
-        logits = self.pred_head(flat) # [B, num_classes]
-
-        # 5. Correction (if neurologist IDs provided)
         if neurologist_ids is not None and self.rater_correction is not None:
             logits_post, l2_loss = self.rater_correction(logits, neurologist_ids)
         else:
             logits_post, l2_loss = logits, 0
 
-        self.l2_loss = l2_loss  # Store for auxiliary loss calculation
-
+        self.l2_loss = l2_loss
         return logits_post, attn_weights
 
-
+    
 def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 # expect data shape: tuple(LaBraM shape: (89, 200), Welch shape: (89, 20, 25)), Label: [1. 1. 1. 1. 1.]
 def unit_test():
-    model = GRU_Classifier(encoder_hidden_size=128, RNN_hidden_size=64, num_layers=2, num_classes=5, num_pool_heads=3, neurologist_correction_config=NeurologistCorrectionConfig(num_neurologists=10, rater_emb_dim=8), use_transformer=False, pooling_output_size=64)
+    model = GRU_Classifier(encoder_hidden_size=128, RNN_hidden_size=64, num_layers=2, num_classes=5, num_pool_heads=3, neurologist_correction_config=NeurologistCorrectionConfig(num_neurologists=10, rater_emb_dim=8), use_mean_pooling=True, pooling_output_size=64)
     print("Number of trainable parameters:", count_parameters(model))
     x_lbr = torch.randn(2, 89, 200)  # batch of 2, 89 time steps, 200 LaBraM features
-    x_welch = torch.abs(torch.randn(2, 89, 20, 50))  # batch of 2, 89 time steps, 20 channels, 25 Welch features
+    x_welch = torch.abs(torch.randn(2, 89, 20, 50))  # batch of 2, 89 time steps, 20 channels, 50 Welch features
     outputs, _ = model((x_lbr, x_welch), neurologist_ids=torch.tensor([1, 2]))  # Provide neurologist IDs for correction
     print("Output:", outputs)  # Expected: (4, 5)
     assert outputs.shape == (2, 5), "Output shape is incorrect"
+    model = model.cuda()
+    print(model.edge_index.device)
 
 if __name__ == "__main__":
     unit_test()

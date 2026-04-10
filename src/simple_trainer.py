@@ -12,7 +12,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
-from utils import Scaler, TemperatureScalerPerLabel
 import pandas as pd
 
 # ----------------------------
@@ -247,25 +246,34 @@ class ModelTrainer:
 
     def _prepare_batch(self, batch: Dict[str, Any]) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         x_lbr, x_welch = batch["x"]
+        sample_weight = batch.get("sample_weight", None)
+        label_mask = batch.get("labels_mask", None)
+
         x_lbr = x_lbr.to(self.device, non_blocking=True)
         x_welch = x_welch.to(self.device, non_blocking=True)
         y = batch["y"].to(self.device, non_blocking=True)
-        if y.dtype != torch.long:
-            y = y.long()
-        sample_weight = batch.get("sample_weight", None)
         if sample_weight is not None:
             sample_weight = sample_weight.to(self.device, non_blocking=True).float()
-        label_mask = batch.get("labels_mask", None)
         if label_mask is not None:
             label_mask = label_mask.to(self.device, non_blocking=True).bool()
 
         neurologist_ids = batch.get("neurologist_id", None)
         if neurologist_ids is not None:
-            neurologist_index = neurologist_ids.to(self.device, non_blocking=True).long()
+            neurologist_ids = neurologist_ids.to(self.device, non_blocking=True).long()
 
-        return (x_lbr, x_welch), y, sample_weight, label_mask, neurologist_index
+        return (x_lbr, x_welch), y, sample_weight, label_mask, neurologist_ids
     
-        
+    # return padding mask for valid segments, shape [B, N_max], True for valid segments, False for padded segments
+    # and the lengths of each EEG in the batch (before padding) as a tensor of shape [B]
+    def _extract_temporal_mask(self, batch: Dict[str, Any]) ->  Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        mask = batch.get("mask", None)
+        lengths = batch.get("lengths", None)
+        if mask is not None:
+            mask = mask.to(self.device, non_blocking=True).bool()
+            lengths = lengths.to(self.device, non_blocking=True).long()
+
+        return mask, lengths
+
     def _weighted_loss(
         self,
         logits: torch.Tensor,
@@ -341,12 +349,15 @@ class ModelTrainer:
 
         for step, batch in enumerate(loader):
             (x_lbr, x_welch), y, weights, label_mask, neurologist_ids = self._prepare_batch(batch)
+            padding_mask, lengths = self._extract_temporal_mask(batch)
+
             neurologist_ids = neurologist_ids if self.train_with_neurologist_ids else None # mean rater embedding handled by model
 
             self.optimizer.zero_grad(set_to_none=True)
             if self.mixed_precision:
                 with torch.autocast(device_type="cuda", dtype=self.autocast_dtype):
-                    logits = self.model((x_lbr, x_welch), neurologist_ids=neurologist_ids, use_mean_rater=True) #training mean rater embedding
+                    logits,_ = self.model((x_lbr, x_welch), neurologist_ids=neurologist_ids,
+                                        mask=padding_mask, lengths=lengths) #training mean rater embedding
                     loss = self._weighted_loss(logits, y, 
                                                     weights if use_sample_weights else None,
                                                     label_mask if use_label_mask else None)
@@ -357,7 +368,8 @@ class ModelTrainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                logits = self.model((x_lbr, x_welch), neurologist_ids=neurologist_ids, use_mean_rater=True) #training mean rater embedding
+                logits,_ = self.model((x_lbr, x_welch), neurologist_ids=neurologist_ids,
+                                    mask=padding_mask, lengths=lengths) #training mean rater embedding
                 loss = self._weighted_loss(logits, y, 
                                                 weights if use_sample_weights else None, 
                                                 label_mask if use_label_mask else None)
@@ -366,7 +378,7 @@ class ModelTrainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 self.optimizer.step()
 
-            total_loss += loss.item() * y.size(0)
+            total_loss += loss.detach().item() * y.size(0)
             total_samples += y.size(0)
 
             with torch.no_grad():
@@ -403,9 +415,10 @@ class ModelTrainer:
 
         for batch in loader:
             (x_lbr, x_welch), y, weights, label_mask, neurologist_ids = self._prepare_batch(batch)
-            logits = self.model((x_lbr, x_welch), neurologist_ids=None, use_mean_rater=True) # eval with mean rater embedding, ignore neurologist IDs
+            padding_mask, lengths = self._extract_temporal_mask(batch)
+            logits,_ = self.model((x_lbr, x_welch), neurologist_ids=None, mask=padding_mask, lengths=lengths) # eval with mean rater embedding, ignore neurologist IDs
             loss = self._weighted_loss(logits, y, weights, label_mask)
-            total_loss += loss.item() * y.size(0)
+            total_loss += loss.detach().item() * y.size(0)
             total_samples += y.size(0)
 
             metrics = self._compute_metrics(logits, y>0.5, label_mask) # prevent continuous labels during metric computation
@@ -475,7 +488,8 @@ class ModelTrainer:
         preds, targets, logits_store = [], [], []
         for batch in loader:
             (x_lbr, x_welch), y, _, _, _ = self._prepare_batch(batch)
-            logits = self.model((x_lbr, x_welch),)
+            padding_mask, lengths = self._extract_temporal_mask(batch)
+            logits, _ = self.model((x_lbr, x_welch), mask=padding_mask, lengths=lengths)
             preds.append(torch.sigmoid(logits).cpu())
             targets.append(y.cpu())
             if return_logits:
@@ -525,7 +539,7 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_ds, batch_size=128, shuffle=False, num_workers=2)
 
     trainer = ModelTrainer(
-        model=GRU_Classifier(hidden_size=128, num_layers=4, num_classes=5, num_neurologists=n_neurologists, rater_emb_dim=4),
+        model=GRU_Classifier(hidden_size=128, num_layers=4, num_classes=5, ),
         lr=3e-4,
         weight_decay=1e-3,
         grad_clip=1.0,
