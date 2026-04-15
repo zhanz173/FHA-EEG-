@@ -25,13 +25,13 @@ class FHA_EEG_Loader(Dataset):
     def _pack_data(self, idx):
         # read EEG file with mne
         file_path = self.file_list[idx]
+        EEG_Id = os.path.basename(file_path).split('_')[0]  # Assuming filename format is "ScanID_raw.fif"
         try:
             raw = mne.io.read_raw_fif(file_path, preload=False, verbose=False)
             raw.pick(FHA_EEG_channels_ORDER)
             raw.resample(self.sampling_rate, npad="auto")
             data = raw.get_data(tmax=self.tmax) # n_channels, n_times
             data = data.astype(np.float32)
-            EEG_Id = os.path.basename(file_path).split('_')[0]  # Assuming filename format is "ScanID_raw.fif"
         except Exception as e:
             print(f"Error loading EEG file {file_path}: {e}")
             data = None

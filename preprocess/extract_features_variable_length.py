@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from pathlib import Path
 
 import h5py
 import numpy as np
@@ -87,7 +88,7 @@ def get_input_chans(ch_names: Sequence[str]) -> List[int]:
 
 def load_pretrained_labram(
     number_of_classes: int = 1,
-    checkpoint_path: str = r"LaBraM\checkpoints\labram-base.pth",
+    checkpoint_path: str = 'LaBraM/checkpoints/labram-base.pth',
     **kwargs,
 ):
     import LaBraM.utils as utils
@@ -101,8 +102,9 @@ def load_pretrained_labram(
         **kwargs,
     )
 
+    checkpoint_file = resolve_checkpoint_file(Path(checkpoint_path))
     checkpoint_model = None
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    checkpoint = torch.load(str(checkpoint_file), map_location='cpu', weights_only=False)
     for model_key in ['model', 'module']:
         if model_key in checkpoint:
             checkpoint_model = checkpoint[model_key]
@@ -148,7 +150,7 @@ class LabramFeatureExtractor(FeatureExtractor):
         n_times: int,
         patch_size: int = 200,
         n_classes: int = 1,
-        checkpoint_path: str = r"preprocess\LaBraM\checkpoints\labram-base.pth",
+        checkpoint_path: str = 'LaBraM/checkpoints/labram-base.pth',
         device: Optional[str] = None,
         **kwargs,
     ):
@@ -439,6 +441,9 @@ class SegmentFeatureGenerator:
 
         for i in range(len(self.dataset)):
             item = self.dataset[i]
+            if item.get('EEG_Raw') is None:
+                print(f"Skipping EEG with failed load: {item.get('ScanID', i)}")
+                continue
             data = np.asarray(item['EEG_Raw'], dtype=np.float32) * self.pipeline.preprocessing_config.scale_factor
             eeg_id = str(item['ScanID'])
 
@@ -625,7 +630,18 @@ def build_feature_extractors(
         )
     return extractors
 
+def ensure_dirs(data_dir: Path, output_root: Path, checkpoint_path: Path) -> None:
+    if not data_dir.is_dir():
+        raise ValueError(f'Data directory {data_dir} does not exist or is not a directory.')
+    checkpoint_file = resolve_checkpoint_file(checkpoint_path)
+    if not checkpoint_file.is_file():
+        raise ValueError(f'Checkpoint file {checkpoint_file} does not exist.')
+    output_root.mkdir(parents=True, exist_ok=True)
 
+
+def resolve_checkpoint_file(checkpoint_path: Path) -> Path:
+    return checkpoint_path / 'labram-base.pth' if checkpoint_path.is_dir() else checkpoint_path
+    
 if __name__ == '__main__':
     from EEG_loader import FHA_EEG_channels_ORDER, FHA_EEG_Loader
 
@@ -636,9 +652,10 @@ if __name__ == '__main__':
     LABRAM_PRETRAINED_FS = 200
     overlap = 0
     segment_duration = 4
-    eeg_feature_save_dir = r"EEG_features\EEG_features_labram_welch_HV'
+    eeg_feature_save_dir = r"EEG_features\EEG_features"
     eeg_data_dir = r'EEG\FHA\hyperventilation'
-    checkpoint_path = r'LaBraM\checkpoints\labram-base.pth'
+    script_dir = Path(__file__).resolve().parent
+    checkpoint_path = str(script_dir / 'LaBraM' / 'checkpoints' / 'labram-base.pth')
 
     parser = argparse.ArgumentParser(description='Extract segment-level EEG features and save as HDF5 shards')
     parser.add_argument('--data_dir', type=str, default=eeg_data_dir)
@@ -659,12 +676,16 @@ if __name__ == '__main__':
     parser.add_argument('--debug', action='store_true')
     args = parser.parse_args()
 
+    ensure_dirs(Path(args.data_dir), Path(args.output_dir), Path(args.checkpoint_path))
+
     dataloader_config = {
         'dataset_root': args.data_dir,
         'tmax': 360,
         'sampling_rate': LABRAM_PRETRAINED_FS, # fixed for LaBraM, will be resampled in loader if needed
     }
     dataset = FHA_EEG_Loader(dataloader_config)
+    if len(dataset) == 0:
+        raise ValueError(f'No .fif files found under data_dir={args.data_dir}')
     print(f'Dataset loaded with {len(dataset)} samples. Example keys: {list(dataset[0].keys())}')
 
     segment_config = SegmentConfig(
