@@ -1,0 +1,26 @@
+# Core numerical stack
+numpy
+scipy
+pandas
+scikit-learn
+
+# Deep learning
+torch
+timm==0.4.12
+einops
+tensorboardX
+
+# EEG IO and feature storage
+mne==1.4.2
+h5py
+pyarrow
+
+# Project training modules
+torch-geometric
+pyparsing
+
+# Utility packages used by LaBraM scripts
+Pillow
+requests
+blobfile
+tqdm

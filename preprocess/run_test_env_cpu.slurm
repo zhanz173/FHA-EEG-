@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=eeg-env-smoke
 #SBATCH --account=def-vvakorin
-#SBATCH --time=00:30:00
+#SBATCH --time=00:15:00
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=16G
 #SBATCH --output=%x-%j.out
@@ -24,7 +24,7 @@ PREPROCESS_DIR="$REPO_ROOT/preprocess"
 INPUT_ROOT_ON_CLUSTER="$HOME/scratch/Burnaby"
 
 # Destination for the small test output.
-FINAL_OUTPUT_ROOT_ON_CLUSTER="$HOME/scratch/EEG_Features/env_smoke_tests"
+FINAL_OUTPUT_ROOT_ON_CLUSTER="$SCRATCH/EEG_Features/env_smoke_tests"
 
 # Python environment activation.
 USE_VENV=1
@@ -41,6 +41,8 @@ if [[ "$USE_VENV" -eq 1 ]]; then
   source "$VENV_PATH/bin/activate"
 fi
 
+pip install -r requirements.txt --no-index 
+
 cd "$PREPROCESS_DIR"
 
 echo "Job ID: ${SLURM_JOB_ID}"
@@ -50,9 +52,14 @@ echo "Python: $(which python)"
 python --version
 
 echo "Checking configured paths..."
-test -d "$INPUT_ROOT_ON_CLUSTER"
-test -f "$CHECKPOINT_PATH"
+echo "INPUT_ROOT_ON_CLUSTER=$INPUT_ROOT_ON_CLUSTER"
+echo "CHECKPOINT_PATH=$CHECKPOINT_PATH"
+echo "FINAL_OUTPUT_ROOT_ON_CLUSTER=$FINAL_OUTPUT_ROOT_ON_CLUSTER"
+
+[[ -d "$INPUT_ROOT_ON_CLUSTER" ]] || { echo "Missing input dir: $INPUT_ROOT_ON_CLUSTER" >&2; exit 1; }
+[[ -f "$CHECKPOINT_PATH" ]] || { echo "Missing checkpoint: $CHECKPOINT_PATH" >&2; exit 1; }
 mkdir -p "$FINAL_OUTPUT_ROOT_ON_CLUSTER"
+
 
 echo "First input files:"
 FIRST_FIF=$(find "$INPUT_ROOT_ON_CLUSTER" -type f -name "*.fif" -print -quit)
