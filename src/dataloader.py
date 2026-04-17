@@ -23,7 +23,14 @@ class EEGDatasetWithLabel(Dataset):
     ## Return (LaBraM, Welch, label) tuples
     def __init__(self, root="h5_eeg_feats", metadata = None,ids=None, return_ids=False, return_neurologist_ids=False, return_ordinal=False):
         self.root = root
-        df = pd.read_parquet(os.path.join(root, "index.parquet"))
+        index_parquet = os.path.join(root, "index.parquet")
+        index_jsonl = os.path.join(root, "index.jsonl")
+        if os.path.exists(index_parquet):
+            df = pd.read_parquet(index_parquet)
+        elif os.path.exists(index_jsonl):
+            df = pd.read_json(index_jsonl, lines=True)
+        else:
+            raise FileNotFoundError(f"No index found under {root}. Expected index.parquet or index.jsonl")
         if ids is not None:
             df = df[df["eeg_id"].isin(set(ids))].reset_index(drop=True)
 

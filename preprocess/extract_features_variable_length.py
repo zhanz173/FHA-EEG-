@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from pathlib import Path
 
 import h5py
 import numpy as np
 import pyarrow as pa
+import pyarrow.json as pajson
 import pyarrow.parquet as pq
 import scipy.signal as signal
 import torch
@@ -428,24 +431,34 @@ class SegmentFeatureGenerator:
         pipeline: FeatureExtractionPipeline,
         write_buffer_size: int = 256,
         skip_short_eeg: bool = False,
+        processed_eeg_ids: Optional[Sequence[str]] = None,
+        progress_total_eegs: Optional[int] = None,
     ):
         self.dataset = dataset
         self.pipeline = pipeline
         self.write_buffer_size = write_buffer_size
         self.skip_short_eeg = skip_short_eeg
+        self.processed_eeg_ids = set(processed_eeg_ids or [])
+        self.progress_total_eegs = progress_total_eegs
 
-    def __iter__(self) -> Iterator[Tuple[Dict[str, np.ndarray], List[Dict[str, Any]]]]:
+    def __iter__(self) -> Iterator[Tuple[Dict[str, np.ndarray], List[Dict[str, Any]], List[str]]]:
         batch_features: Dict[str, List[np.ndarray]] = {name: [] for name in self.pipeline.feature_names}
         batch_meta: List[Dict[str, Any]] = []
+        completed_eeg_ids_since_flush: List[str] = []
         min_samples = self.pipeline.segment_config.duration_samples
+        completed_count = len(self.processed_eeg_ids)
 
         for i in range(len(self.dataset)):
             item = self.dataset[i]
             if item.get('EEG_Raw') is None:
                 print(f"Skipping EEG with failed load: {item.get('ScanID', i)}")
                 continue
+
             data = np.asarray(item['EEG_Raw'], dtype=np.float32) * self.pipeline.preprocessing_config.scale_factor
             eeg_id = str(item['ScanID'])
+
+            if eeg_id in self.processed_eeg_ids:
+                continue
 
             if self.skip_short_eeg and data.shape[-1] < min_samples:
                 continue
@@ -467,44 +480,151 @@ class SegmentFeatureGenerator:
                     batch_features[name].append(feature_map[name][seg_idx])
 
                 if len(batch_meta) == self.write_buffer_size:
-                    yield self._flush(batch_features, batch_meta)
+                    yield self._flush(batch_features, batch_meta, completed_eeg_ids_since_flush)
                     batch_features = {name: [] for name in self.pipeline.feature_names}
                     batch_meta = []
+                    completed_eeg_ids_since_flush = []
 
-        if batch_meta:
-            yield self._flush(batch_features, batch_meta)
+            completed_eeg_ids_since_flush.append(eeg_id)
+            completed_count += 1
+            self._print_progress(eeg_id, completed_count)
 
+            # Important: if the EEG ended exactly on a flush boundary, there are no
+            # pending rows left to trigger another flush. Persist completion anyway.
+            if not batch_meta and completed_eeg_ids_since_flush:
+                yield {}, [], completed_eeg_ids_since_flush
+                completed_eeg_ids_since_flush = []
+
+        if batch_meta or completed_eeg_ids_since_flush:
+            yield self._flush(batch_features, batch_meta, completed_eeg_ids_since_flush)
+            
     def _flush(
         self,
         batch_features: Dict[str, List[np.ndarray]],
         batch_meta: List[Dict[str, Any]],
-    ) -> Tuple[Dict[str, np.ndarray], List[Dict[str, Any]]]:
+        completed_eeg_ids: List[str],
+    ) -> Tuple[Dict[str, np.ndarray], List[Dict[str, Any]], List[str]]:
         stacked_features = {
             name: np.stack(feature_rows).astype(np.float32)
             for name, feature_rows in batch_features.items()
         }
-        return stacked_features, list(batch_meta)
+        return stacked_features, list(batch_meta), list(completed_eeg_ids)
+
+    def _print_progress(self, eeg_id: str, completed_count: int) -> None:
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        if self.progress_total_eegs is None:
+            print(f'[{timestamp}] Processed EEG {completed_count}: {eeg_id}')
+            return
+        print(f'[{timestamp}] Processed EEG {completed_count}/{self.progress_total_eegs}: {eeg_id}')
 
     def __len__(self) -> int:
         return len(self.dataset)
 
 
+@dataclass
+class ResumeState:
+    shard_id: int = -1
+    write_pos: int = 0
+    feature_shapes: Optional[Dict[str, Tuple[int, ...]]] = None
+    processed_eeg_ids: Optional[List[str]] = None
+
+
+def _resume_file_paths(out_dir: str) -> Dict[str, str]:
+    return {
+        'state': os.path.join(out_dir, 'resume_state.json'),
+        'index_jsonl': os.path.join(out_dir, 'index.jsonl'),
+        'index_parquet': os.path.join(out_dir, 'index.parquet'),
+    }
+
+
+def load_resume_state(out_dir: str) -> ResumeState:
+    paths = _resume_file_paths(out_dir)
+    if not os.path.exists(paths['state']):
+        return ResumeState(processed_eeg_ids=[])
+
+    with open(paths['state'], 'r', encoding='utf-8') as f:
+        payload = json.load(f)
+
+    return ResumeState(
+        shard_id=int(payload.get('shard_id', -1)),
+        write_pos=int(payload.get('write_pos', 0)),
+        feature_shapes={
+            name: tuple(shape)
+            for name, shape in payload.get('feature_shapes', {}).items()
+        } or None,
+        processed_eeg_ids=list(payload.get('processed_eeg_ids', [])),
+    )
+
+
+def save_resume_state(out_dir: str, state: ResumeState) -> None:
+    paths = _resume_file_paths(out_dir)
+    payload = {
+        'shard_id': state.shard_id,
+        'write_pos': state.write_pos,
+        'feature_shapes': {
+            name: list(shape)
+            for name, shape in (state.feature_shapes or {}).items()
+        },
+        'processed_eeg_ids': sorted(set(state.processed_eeg_ids or [])),
+    }
+    with open(paths['state'], 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2)
+
+
+def append_index_rows(index_jsonl_path: str, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+    with open(index_jsonl_path, 'a', encoding='utf-8') as f:
+        for row in rows:
+            f.write(json.dumps(row))
+            f.write('\n')
+
+
+def finalize_index_files(out_dir: str) -> None:
+    paths = _resume_file_paths(out_dir)
+    if not os.path.exists(paths['index_jsonl']):
+        return
+
+    index_df = pajson.read_json(paths['index_jsonl']).to_pandas()
+    pq.write_table(pa.Table.from_pandas(index_df, preserve_index=False), paths['index_parquet'])
+
+
+def ensure_output_dir_is_ready(out_dir: str, resume: bool) -> None:
+    if resume:
+        return
+
+    paths = _resume_file_paths(out_dir)
+    existing_shards = [
+        name for name in os.listdir(out_dir)
+        if name.startswith('shard_') and name.endswith('.h5')
+    ]
+    existing_resume_files = [path for path in paths.values() if os.path.exists(path)]
+    if existing_shards or existing_resume_files:
+        raise ValueError(
+            'Output directory already contains feature shards or resume files. '
+            'Use resume mode or point --output_dir to a fresh directory.'
+        )
+
+
 def build_h5_shards_from_segment_batches(
-    batch_iter: Iterable[Tuple[Dict[str, np.ndarray], List[Dict[str, Any]]]],
+    batch_iter: Iterable[Tuple[Dict[str, np.ndarray], List[Dict[str, Any]], List[str]]],
     out_dir: str = 'h5_shards',
     rows_per_shard: int = 20000,
     compression: str = 'lzf',
     compression_opts: Optional[int] = None,
     debug: bool = False,
+    resume: bool = True,
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
-    index_rows: List[Dict[str, Any]] = []
+    ensure_output_dir_is_ready(out_dir, resume=resume)
+    paths = _resume_file_paths(out_dir)
+    resume_state = load_resume_state(out_dir) if resume else ResumeState(processed_eeg_ids=[])
 
-    shard_id = -1
+    shard_id = resume_state.shard_id
     f = None
     datasets: Dict[str, Any] = {}
-    write_pos = 0
-    feature_shapes: Optional[Dict[str, Tuple[int, ...]]] = None
+    write_pos = resume_state.write_pos
+    feature_shapes: Optional[Dict[str, Tuple[int, ...]]] = resume_state.feature_shapes
     current_shard_path: Optional[str] = None
 
     if debug:
@@ -512,6 +632,24 @@ def build_h5_shards_from_segment_batches(
             f'Starting to build HDF5 shards in {out_dir} with rows_per_shard={rows_per_shard}, '
             f'compression={compression}, compression_opts={compression_opts}'
         )
+
+    if resume and shard_id >= 0:
+        current_shard_path = os.path.join(out_dir, f'shard_{shard_id:05d}.h5')
+        if os.path.exists(current_shard_path):
+            f = h5py.File(current_shard_path, 'r+')
+            if feature_shapes is None:
+                feature_names = [name.decode('utf-8') if isinstance(name, bytes) else str(name) for name in f.attrs['feature_names']]
+                feature_shapes = {
+                    name: tuple(f.attrs[f'{name}_shape_per_row'])
+                    for name in feature_names
+                }
+            datasets = {name: f[name] for name in feature_shapes}
+            if debug:
+                print(f'Resuming from shard {current_shard_path} at row {write_pos}.')
+        else:
+            shard_id = -1
+            write_pos = 0
+            feature_shapes = None
 
     def new_shard(shapes: Dict[str, Tuple[int, ...]]) -> str:
         nonlocal shard_id, f, datasets, write_pos, current_shard_path
@@ -544,12 +682,21 @@ def build_h5_shards_from_segment_batches(
         write_pos = 0
         return current_shard_path
 
-    for feature_map, meta in batch_iter:
+    for feature_map, meta, completed_eeg_ids in batch_iter:
         if not feature_map:
+            if completed_eeg_ids:
+                resume_state = ResumeState(
+                    shard_id=shard_id,
+                    write_pos=write_pos,
+                    feature_shapes=feature_shapes,
+                    processed_eeg_ids=sorted(set((resume_state.processed_eeg_ids or []) + completed_eeg_ids)),
+                )
+                save_resume_state(out_dir, resume_state)
             continue
 
         feature_map = {name: np.asarray(values, dtype=np.float32) for name, values in feature_map.items()}
         row_count = next(iter(feature_map.values())).shape[0]
+        batch_index_rows: List[Dict[str, Any]] = []
 
         for name, values in feature_map.items():
             if values.shape[0] != row_count:
@@ -579,10 +726,24 @@ def build_h5_shards_from_segment_batches(
                 row_meta = dict(meta[start + i])
                 row_meta['shard'] = os.path.basename(current_shard_path)
                 row_meta['row'] = int(write_pos + i)
-                index_rows.append(row_meta)
+                batch_index_rows.append(row_meta)
 
             write_pos += take
             start += take
+
+        if f is not None:
+            f.attrs['last_write_pos'] = write_pos
+            f.flush()
+
+        append_index_rows(paths['index_jsonl'], batch_index_rows)
+        resume_state = ResumeState(
+            shard_id=shard_id,
+            write_pos=write_pos,
+            feature_shapes=feature_shapes,
+            processed_eeg_ids=sorted(set((resume_state.processed_eeg_ids or []) + completed_eeg_ids)),
+        )
+        save_resume_state(out_dir, resume_state)
+
         if debug:
             # break after first shard for quick debugging
             if shard_id > 0:
@@ -595,8 +756,8 @@ def build_h5_shards_from_segment_batches(
         f.flush()
         f.close()
 
-    if index_rows:
-        pq.write_table(pa.Table.from_pylist(index_rows), os.path.join(out_dir, 'index.parquet'))
+    if os.path.exists(paths['index_jsonl']):
+        finalize_index_files(out_dir)
     else:
         print('No rows written. Check segment duration, overlap, and input data lengths.')
 
@@ -673,10 +834,18 @@ if __name__ == '__main__':
     parser.add_argument('--compression_opts', type=int, default=4, help='Compression level for gzip (1-9)')
     parser.add_argument('--extractors', nargs='+', default=['labram', 'welch'], choices=['labram', 'welch'])
     parser.add_argument('--skip_short_eeg', action='store_true', help='Skip EEGs shorter than one segment')
+    parser.add_argument('--no_resume', action='store_true', help='Disable resume and always start a fresh run')
     parser.add_argument('--debug', action='store_true')
     args = parser.parse_args()
 
     ensure_dirs(Path(args.data_dir), Path(args.output_dir), Path(args.checkpoint_path))
+    if args.no_resume:
+        print('Resume disabled: existing progress files in the output directory will be ignored.')
+        processed_eeg_ids: List[str] = []
+    else:
+        processed_eeg_ids = load_resume_state(args.output_dir).processed_eeg_ids or []
+        if processed_eeg_ids:
+            print(f'Resuming feature extraction. Skipping {len(processed_eeg_ids)} completed EEGs.')
 
     dataloader_config = {
         'dataset_root': args.data_dir,
@@ -719,6 +888,8 @@ if __name__ == '__main__':
         pipeline=pipeline,
         write_buffer_size=args.write_buffer_size,
         skip_short_eeg=args.skip_short_eeg,
+        processed_eeg_ids=processed_eeg_ids,
+        progress_total_eegs=len(dataset),
     )
 
     if args.debug:
@@ -731,4 +902,5 @@ if __name__ == '__main__':
         compression=args.compression,
         compression_opts=args.compression_opts,
         debug=args.debug,
+        resume=not args.no_resume,
     )

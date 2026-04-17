@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=eeg-env-smoke
 #SBATCH --account=def-vvakorin
-#SBATCH --time=00:15:00
+#SBATCH --time=15:00:00
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=16G
 #SBATCH --output=%x-%j.out
